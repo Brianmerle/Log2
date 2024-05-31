@@ -1,0 +1,280 @@
+// Log2 V1.0.0 31/5/2024 
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <NMEAGPS.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <SD.h>
+
+// OLED display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// GPS settings
+NMEAGPS gps; // This parses the GPS characters
+HardwareSerial &gpsSerial = Serial1;
+
+// Temperature sensor settings
+#define ONE_WIRE_BUS 10
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+DeviceAddress sensor1, sensor2;
+
+// SD card settings
+const int chipSelect = BUILTIN_SDCARD;
+
+// LED pin
+const int ledPin = 35;
+
+// Variables to store the last valid data
+int lastHours = -1, lastMinutes = -1, lastSeconds = -1;
+double lastAltitude = 0;
+float lastTemp1 = 0, lastTemp2 = 0;
+bool gpsConfigured = false;
+bool loggingStarted = false;
+
+byte gps_set_success = 0;
+
+void sendUBX(uint8_t *msg, uint8_t len) {
+  for (uint8_t i = 0; i < len; i++) {
+    gpsSerial.write(msg[i]);
+    Serial.print(msg[i], HEX);
+    Serial.print(" ");
+  }
+  gpsSerial.flush();  // Ensure the message is sent
+  Serial.println();
+}
+
+boolean getUBX_ACK(uint8_t *msg) {
+  uint8_t b;
+  uint8_t ackByteID = 0;
+  uint8_t ackPacket[10];
+  unsigned long startTime = millis();
+  Serial.print(" * Reading ACK response: ");
+
+  // Construct the expected ACK packet
+  ackPacket[0] = 0xB5;  // header
+  ackPacket[1] = 0x62;  // header
+  ackPacket[2] = 0x05;  // class
+  ackPacket[3] = 0x01;  // id
+  ackPacket[4] = 0x02;  // length
+  ackPacket[5] = 0x00;
+  ackPacket[6] = msg[2];  // ACK class
+  ackPacket[7] = msg[3];  // ACK id
+  ackPacket[8] = 0;   // CK_A
+  ackPacket[9] = 0;   // CK_B
+
+  // Calculate the checksums
+  for (uint8_t i = 2; i < 8; i++) {
+    ackPacket[8] = ackPacket[8] + ackPacket[i];
+    ackPacket[9] = ackPacket[9] + ackPacket[8];
+  }
+
+  while (1) {
+    // Test for success
+    if (ackByteID > 9) {
+      // All packets in order!
+      Serial.println(" (SUCCESS!)");
+      return true;
+    }
+
+    // Timeout if no valid response in 3 seconds
+    if (millis() - startTime > 3000) {
+      Serial.println(" (FAILED!)");
+      return false;
+    }
+
+    // Make sure data is available to read
+    if (gpsSerial.available()) {
+      b = gpsSerial.read();
+
+      // Check that bytes arrive in sequence as per expected ACK packet
+      if (b == ackPacket[ackByteID]) {
+        ackByteID++;
+        Serial.print(b, HEX);
+        Serial.print(" ");
+      } else {
+        ackByteID = 0;  // Reset and look again, invalid order
+      }
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600); // Start the UART for the GPS device
+
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.display();
+  delay(2000);
+  display.clearDisplay();
+
+  // Initialize temperature sensors
+  sensors.begin();
+  if (sensors.getAddress(sensor1, 0)) {
+    sensors.setResolution(sensor1, 12);
+  }
+  if (sensors.getAddress(sensor2, 1)) {
+    sensors.setResolution(sensor2, 12);
+  }
+
+  // Initialize SD card
+  if (!SD.begin(chipSelect)) {
+    Serial.println("SD card initialization failed!");
+    return;
+  }
+  Serial.println("SD card initialized.");
+
+  // Initialize LED pin
+  pinMode(ledPin, OUTPUT);
+  digitalWrite(ledPin, LOW); // Ensure the LED is off initially
+
+  Serial.println("Setting uBlox flight mode: ");
+  uint8_t setNav[] = {
+    0xB5, 0x62, 0x06, 0x24, 0x24, 0x00, 0xFF, 0xFF, 0x06, 0x03, 0x00, 0x00, 0x00, 0x00, 0x10, 0x27, 0x00, 0x00,
+    0x05, 0x00, 0xFA, 0x00, 0xFA, 0x00, 0x64, 0x00, 0x2C, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xDC
+  };
+
+  while (!gps_set_success) {
+    sendUBX(setNav, sizeof(setNav) / sizeof(uint8_t));
+    gps_set_success = getUBX_ACK(setNav);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Display "GPS CONFIG" centered on the top line
+  String line1 = "GPS CONFIG";
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(line1, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 0);
+  display.print(line1);
+
+  // Display "SUCCESS" or "FAIL" centered on the second line
+  String line2 = gps_set_success ? "SUCCESS" : "FAIL";
+  display.getTextBounds(line2, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, 32);
+  display.print(line2);
+
+  display.display();
+
+  if (gps_set_success) {
+    Serial.println("Airborne <1G mode set successfully.");
+  } else {
+    Serial.println("Failed to set Airborne <1G mode.");
+  }
+
+  Serial.println("Finished setting flight mode.");
+  delay(5000); // Display success/fail message for 5 seconds
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor((SCREEN_WIDTH - w) / 2, (SCREEN_HEIGHT - 16) / 2); // Center vertically
+  display.print("GPS INIT");
+  display.display();
+}
+
+void loop() {
+  while (gpsSerial.available() > 0) {
+    gps.handle(gpsSerial.read());
+  }
+
+  if (gps.available()) {
+    gps_fix fix = gps.read();
+    if (fix.valid.time && fix.valid.altitude) {
+      loggingStarted = true;
+
+      // Get time (adjusted for UTC-5)
+      int hours = fix.dateTime.hours - 5;
+      if (hours < 0) hours += 24;
+      int minutes = fix.dateTime.minutes;
+      int seconds = fix.dateTime.seconds;
+
+      // Get altitude in meters
+      double altitude = fix.altitude(); // Altitude in meters
+
+      // Control the LED based on altitude
+      if (altitude > 200) {
+        digitalWrite(ledPin, HIGH); // Turn on LED if altitude is over 200 meters
+      } else {
+        digitalWrite(ledPin, LOW); // Turn off LED if altitude is 200 meters or below
+      }
+
+      // Get temperature data
+      sensors.requestTemperatures();
+      float temp1 = sensors.getTempC(sensor1);
+      float temp2 = sensors.getTempC(sensor2);
+
+      // Log data to SD card
+      File dataFile = SD.open("datalog.txt", FILE_WRITE);
+      if (dataFile) {
+        dataFile.print(hours); dataFile.print(":");
+        dataFile.print(minutes); dataFile.print(":");
+        dataFile.print(seconds); dataFile.print(",");
+        dataFile.print(fix.latitude(), 6); dataFile.print(",");
+        dataFile.print(fix.longitude(), 6); dataFile.print(",");
+        dataFile.print(altitude); dataFile.print(",");
+        dataFile.print(temp1); dataFile.print(",");
+        dataFile.println(temp2);
+        dataFile.close();
+      } else {
+        Serial.println("Error opening datalog.txt");
+      }
+
+      // Update display
+      display.clearDisplay();
+      display.setTextSize(2);
+
+      // Display time centered
+      String timeString = String(hours) + ":" + (minutes < 10 ? "0" : "") + String(minutes) + ":" + (seconds < 10 ? "0" : "") + String(seconds);
+      int16_t x1, y1;
+      uint16_t w, h;
+      display.getTextBounds(timeString, 0, 0, &x1, &y1, &w, &h);
+      display.setCursor((SCREEN_WIDTH - w) / 2, 0);
+      display.print(timeString);
+
+      // Display altitude right-justified
+      display.setTextSize(2);
+      String altitudeString = String(altitude, 2);
+      display.getTextBounds(altitudeString, 0, 0, &x1, &y1, &w, &h);
+      display.setCursor(SCREEN_WIDTH - w - 24, 16); // Adjusted to account for " m" width
+      display.print(altitudeString);
+      display.print(" m");
+
+      // Display temperatures right-justified
+      String temp1String = String(temp1, 1);
+      display.getTextBounds(temp1String, 0, 0, &x1, &y1, &w, &h);
+      display.setCursor(SCREEN_WIDTH - w - 24, 32); // Adjusted to account for " C" width
+      display.print(temp1String);
+      display.print(" C");
+
+      String temp2String = String(temp2, 1);
+      display.getTextBounds(temp2String, 0, 0, &x1, &y1, &w, &h);
+      display.setCursor(SCREEN_WIDTH - w - 24, 48); // Adjusted to account for " C" width
+      display.print(temp2String);
+      display.print(" C");
+
+      display.display();
+    } else if (!loggingStarted) {
+      // Display message indicating GPS is initializing
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor((SCREEN_WIDTH - 60) / 2, (SCREEN_HEIGHT - 16) / 2); // Center vertically
+      display.print("GPS INIT");
+      display.display();
+    }
+  }
+}
